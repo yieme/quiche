@@ -31,6 +31,8 @@ use std::net::ToSocketAddrs;
 
 use ring::rand::*;
 
+use quiche::h3::Connection;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 const USAGE: &str = "Usage:
@@ -297,58 +299,61 @@ fn main() {
             http3_conn = Some(h3_conn);
         }
 
+        let mut p = |h3: &mut Connection, c: &mut quiche::Connection, s, ev| {
+            let mut buf = [0; 4096];
+
+            match ev {
+                quiche::h3::Event::Headers(headers) => {
+                    info!(
+                        "got response headers {:?} on stream id {}",
+                        headers, s
+                    );
+                },
+
+                quiche::h3::Event::Data => {
+                    if let Ok(read) = h3.recv_body(c, s, &mut buf) {
+                        debug!(
+                            "got {} bytes of response data on stream {}",
+                            read, s
+                        );
+
+                        print!("{}", unsafe {
+                            std::str::from_utf8_unchecked(&buf[..read])
+                        });
+                    }
+                },
+
+                quiche::h3::Event::Finished => {
+                    reqs_complete += 1;
+
+                    debug!("{}/{} responses received", reqs_complete, reqs_count);
+
+                    if reqs_complete == reqs_count {
+                        info!(
+                            "{}/{} response(s) received in {:?}, closing...",
+                            reqs_complete,
+                            reqs_count,
+                            req_start.elapsed()
+                        );
+
+                        match c.close(true, 0x00, b"kthxbye") {
+                            // Already closed.
+                            Ok(_) | Err(quiche::Error::Done) => (),
+
+                            Err(e) => panic!("error closing conn: {:?}", e),
+                        }
+                    }
+                },
+            }
+
+            Ok(())
+        };
+
         if let Some(http3_conn) = &mut http3_conn {
             // Process HTTP/3 events.
             loop {
-                match http3_conn.poll(&mut conn) {
-                    Ok((stream_id, quiche::h3::Event::Headers(headers))) => {
-                        info!(
-                            "got response headers {:?} on stream id {}",
-                            headers, stream_id
-                        );
-                    },
-
-                    Ok((stream_id, quiche::h3::Event::Data)) => {
-                        if let Ok(read) =
-                            http3_conn.recv_body(&mut conn, stream_id, &mut buf)
-                        {
-                            debug!(
-                                "got {} bytes of response data on stream {}",
-                                read, stream_id
-                            );
-
-                            print!("{}", unsafe {
-                                std::str::from_utf8_unchecked(&buf[..read])
-                            });
-                        }
-                    },
-
-                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
-                        reqs_complete += 1;
-
-                        debug!(
-                            "{}/{} responses received",
-                            reqs_complete, reqs_count
-                        );
-
-                        if reqs_complete == reqs_count {
-                            info!(
-                                "{}/{} response(s) received in {:?}, closing...",
-                                reqs_complete,
-                                reqs_count,
-                                req_start.elapsed()
-                            );
-
-                            match conn.close(true, 0x00, b"kthxbye") {
-                                // Already closed.
-                                Ok(_) | Err(quiche::Error::Done) => (),
-
-                                Err(e) => panic!("error closing conn: {:?}", e),
-                            }
-
-                            break;
-                        }
-                    },
+                match http3_conn.poll2(&mut conn, &mut p) {
+                    Ok(()) => (),
 
                     Err(quiche::h3::Error::Done) => {
                         break;

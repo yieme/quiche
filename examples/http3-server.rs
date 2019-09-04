@@ -29,9 +29,15 @@ extern crate log;
 
 use std::net;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use std::collections::HashMap;
 
 use ring::rand::*;
+
+use quiche::h3::Connection;
+use quiche::h3::Event;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -59,12 +65,17 @@ struct PartialResponse {
 struct Client {
     conn: Box<quiche::Connection>,
 
-    http3_conn: Option<quiche::h3::Connection>,
+    http3_conn: Option<Connection>,
 
-    partial_responses: HashMap<u64, PartialResponse>,
+    // TODO: closures in Rust can't capture disjoint struct fields, so to avoid
+    // capturing the whole struct we need "interior mutability"
+    // (see https://github.com/rust-lang/rust/issues/53488)
+    partial_responses: Rc<RefCell<PartialMap>>,
 }
 
 type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
+
+type PartialMap = HashMap<u64, PartialResponse>;
 
 fn main() {
     let mut buf = [0; 65535];
@@ -283,7 +294,7 @@ fn main() {
                 let client = Client {
                     conn,
                     http3_conn: None,
-                    partial_responses: HashMap::new(),
+                    partial_responses: Rc::new(RefCell::new(PartialMap::new())),
                 };
 
                 clients.insert(scid.to_vec(), (src, client));
@@ -318,7 +329,7 @@ fn main() {
                     client.conn.trace_id()
                 );
 
-                let h3_conn = match quiche::h3::Connection::with_transport(
+                let h3_conn = match Connection::with_transport(
                     &mut client.conn,
                     &h3_config,
                 ) {
@@ -334,6 +345,27 @@ fn main() {
                 client.http3_conn = Some(h3_conn);
             }
 
+            let partial = client.partial_responses.clone();
+
+            let p = |h3: &mut Connection, c: &mut quiche::Connection, s, ev| {
+                let root = args.get_str("--root");
+
+                let mut partial = partial.borrow_mut();
+
+                match ev {
+                    Event::Headers(headers) =>
+                        handle_request(h3, c, s, &headers, root, &mut partial),
+
+                    Event::Data => {
+                        info!("{} got data on stream id {}", c.trace_id(), s);
+                    },
+
+                    Event::Finished => (),
+                }
+
+                Ok(())
+            };
+
             if client.http3_conn.is_some() {
                 // Handle writable streams.
                 for stream_id in client.conn.writable() {
@@ -344,25 +376,8 @@ fn main() {
                 loop {
                     let http3_conn = client.http3_conn.as_mut().unwrap();
 
-                    match http3_conn.poll(client.conn.as_mut()) {
-                        Ok((stream_id, quiche::h3::Event::Headers(headers))) => {
-                            handle_request(
-                                client,
-                                stream_id,
-                                &headers,
-                                args.get_str("--root"),
-                            );
-                        },
-
-                        Ok((stream_id, quiche::h3::Event::Data)) => {
-                            info!(
-                                "{} got data on stream id {}",
-                                client.conn.trace_id(),
-                                stream_id
-                            );
-                        },
-
-                        Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+                    match http3_conn.poll2(&mut client.conn, p) {
+                        Ok(()) => (),
 
                         Err(quiche::h3::Error::Done) => {
                             break;
@@ -494,12 +509,9 @@ fn validate_token<'a>(
 
 /// Handles incoming HTTP/3 requests.
 fn handle_request(
-    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header],
-    root: &str,
+    http3_conn: &mut Connection, conn: &mut quiche::Connection, stream_id: u64,
+    headers: &[quiche::h3::Header], root: &str, partial: &mut PartialMap,
 ) {
-    let conn = &mut client.conn;
-    let http3_conn = &mut client.http3_conn.as_mut().unwrap();
-
     info!(
         "{} got request {:?} on stream id {}",
         conn.trace_id(),
@@ -532,7 +544,7 @@ fn handle_request(
 
     if written < body.len() {
         let response = PartialResponse { body, written };
-        client.partial_responses.insert(stream_id, response);
+        partial.insert(stream_id, response);
     }
 }
 
@@ -593,11 +605,13 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
 
     debug!("{} stream {} is writable", conn.trace_id(), stream_id);
 
-    if !client.partial_responses.contains_key(&stream_id) {
+    if !client.partial_responses.borrow_mut().contains_key(&stream_id) {
         return;
     }
 
-    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
+    let mut partial = client.partial_responses.borrow_mut();
+
+    let resp = partial.get_mut(&stream_id).unwrap();
     let body = &resp.body[resp.written..];
 
     let written = match http3_conn.send_body(conn, stream_id, body, true) {
@@ -614,7 +628,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     resp.written += written;
 
     if resp.written == resp.body.len() {
-        client.partial_responses.remove(&stream_id);
+        client.partial_responses.borrow_mut().remove(&stream_id);
     }
 }
 

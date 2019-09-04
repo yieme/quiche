@@ -826,6 +826,59 @@ impl Connection {
         Err(Error::Done)
     }
 
+    pub fn poll2<F>(
+        &mut self, conn: &mut super::Connection, mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(
+            &mut Connection,
+            &mut super::Connection,
+            u64,
+            Event,
+        ) -> Result<()>,
+    {
+        // Process control streams first.
+        if let Some(stream_id) = self.peer_control_stream_id {
+            self.process_control_stream(conn, stream_id)?;
+        }
+
+        if let Some(stream_id) = self.peer_qpack_streams.encoder_stream_id {
+            self.process_control_stream(conn, stream_id)?;
+        }
+
+        if let Some(stream_id) = self.peer_qpack_streams.decoder_stream_id {
+            self.process_control_stream(conn, stream_id)?;
+        }
+
+        // Process finished streams list.
+        if let Some(finished) = self.finished_streams.pop_front() {
+            f(self, conn, finished, Event::Finished)?;
+        }
+
+        // Process HTTP/3 data from readable streams.
+        for s in conn.readable() {
+            trace!("{} stream id {} is readable", conn.trace_id(), s);
+
+            let ev = match self.process_readable_stream(conn, s) {
+                Ok(v) => Some(v),
+
+                Err(Error::Done) => None,
+
+                Err(e) => return Err(e),
+            };
+
+            if conn.stream_finished(s) {
+                self.finished_streams.push_back(s);
+            }
+
+            if let Some((stream_id, ev)) = ev {
+                f(self, conn, stream_id, ev)?;
+            }
+        }
+
+        Err(Error::Done)
+    }
+
     /// Allocates a new request stream ID for the local endpoint to use.
     fn get_available_request_stream(&mut self) -> Result<u64> {
         if self.highest_request_stream_id < std::u64::MAX {
