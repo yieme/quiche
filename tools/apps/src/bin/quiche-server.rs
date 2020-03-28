@@ -59,6 +59,7 @@ Options:
   --no-retry                  Disable stateless retry.
   --no-grease                 Don't send GREASE.
   --http-version VERSION      HTTP version to use [default: all].
+  --disable-hystart           Disable HyStart++.
   -h --help                   Show this screen.
 ";
 
@@ -119,6 +120,10 @@ fn main() {
 
     if std::env::var_os("SSLKEYLOGFILE").is_some() {
         config.log_keys();
+    }
+
+    if conn_args.disable_hystart {
+        config.set_hystart(false);
     }
 
     let rng = SystemRandom::new();
