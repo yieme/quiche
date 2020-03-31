@@ -1850,7 +1850,13 @@ impl Connection {
                     // Consider the stream flushable also when we are sending a
                     // zero-length frame that has the fin flag set.
                     if (stream.is_flushable() || empty_fin) && !was_flushable {
-                        self.streams.push_flushable(stream_id);
+                        let urgency = stream.urgency;
+                        let incremental = stream.incremental;
+                        self.streams.push_flushable(
+                            stream_id,
+                            urgency,
+                            incremental,
+                        );
                     }
                 },
 
@@ -2199,7 +2205,10 @@ impl Connection {
                 // If the stream is still flushable, push it to the back of the
                 // queue again.
                 if stream.is_flushable() {
-                    self.streams.push_flushable(stream_id);
+                    let urgency = stream.urgency;
+                    let incremental = stream.incremental;
+                    self.streams
+                        .push_flushable(stream_id, urgency, incremental);
                 }
 
                 // When fuzzing, try to coalesce multiple STREAM frames in the
@@ -2536,6 +2545,9 @@ impl Connection {
 
         let sent = stream.send.push_slice(buf, fin)?;
 
+        let urgency = stream.urgency;
+        let incremental = stream.incremental;
+
         let flushable = stream.is_flushable();
 
         let writable = stream.is_writable();
@@ -2556,7 +2568,8 @@ impl Connection {
         // Consider the stream flushable also when we are sending a zero-length
         // frame that has the fin flag set.
         if (flushable || empty_fin) && !was_flushable {
-            self.streams.push_flushable(stream_id);
+            self.streams
+                .push_flushable(stream_id, urgency, incremental);
         }
 
         if !writable {
@@ -2580,6 +2593,38 @@ impl Connection {
         });
 
         Ok(sent)
+    }
+
+    /// Sets the priority for a stream.
+    ///
+    /// A stream's priority determines the order in which stream data is sent
+    /// on the wire (streams with lower priority are sent first). Streams are
+    /// created with a default priority of `127`.
+    ///
+    /// If the stream did not exist prior to calling this method, the error
+    /// [`InvalidStreamState`] is returned.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
+    pub fn stream_priority(
+        &mut self, stream_id: u64, urgency: u8, incremental: bool,
+    ) -> Result<()> {
+        // Get existing stream.
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(Error::InvalidStreamState)?;
+
+        if stream.urgency == urgency && stream.incremental == incremental {
+            return Ok(());
+        }
+
+        stream.urgency = urgency;
+        stream.incremental = incremental;
+
+        // TODO: reprioritization
+
+        Ok(())
     }
 
     /// Shuts down reading or writing from/to the specified stream.
@@ -3278,7 +3323,10 @@ impl Connection {
                 // If the stream is now flushable push it to the flushable queue,
                 // but only if it wasn't already queued.
                 if stream.is_flushable() && !was_flushable {
-                    self.streams.push_flushable(stream_id);
+                    let urgency = stream.urgency;
+                    let incremental = stream.incremental;
+                    self.streams
+                        .push_flushable(stream_id, urgency, incremental);
                 }
 
                 if writable {
@@ -6013,6 +6061,306 @@ mod tests {
         assert_eq!(iter.next(), Some(&frame::Frame::Padding { len: 1 }));
 
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    /// Tests that streams are correctly scheduled based on their priority.
+    fn stream_priority() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(0);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(0);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(12, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut b = [0; 1];
+
+        pipe.server.stream_recv(0, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(0, 255, true), Ok(()));
+        pipe.server.stream_send(0, b"b", false).unwrap();
+
+        pipe.server.stream_recv(12, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(12, 42, true), Ok(()));
+        pipe.server.stream_send(12, b"b", false).unwrap();
+
+        pipe.server.stream_recv(8, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(8, 10, true), Ok(()));
+        pipe.server.stream_send(8, b"b", false).unwrap();
+
+        pipe.server.stream_recv(4, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(4, 42, true), Ok(()));
+        pipe.server.stream_send(4, b"b", false).unwrap();
+
+        // First is stream 8.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 8,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        // Then are stream 12 and 4, with the same priority.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 12,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        // Final is stream 0.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+
+        // Again.
+        //
+
+        pipe.server.stream_send(0, b"c", false).unwrap();
+
+        pipe.server.stream_send(12, b"c", false).unwrap();
+
+        pipe.server.stream_send(8, b"c", false).unwrap();
+
+        pipe.server.stream_send(4, b"c", false).unwrap();
+
+        // First is stream 8.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 8,
+                data: stream::RangeBuf::from(b"b", 1, false),
+            })
+        );
+
+        // Then are stream 12 and 4, with the same priority.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 12,
+                data: stream::RangeBuf::from(b"b", 1, false),
+            })
+        );
+
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"b", 1, false),
+            })
+        );
+
+        // Final is stream 0.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"b", 1, false),
+            })
+        );
+
+        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+    }
+
+    #[test]
+    /// Tests that changing a stream's priority is correctly propagated.
+    #[should_panic]
+    fn stream_reprioritize() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(0);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(0);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(12, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut b = [0; 1];
+
+        pipe.server.stream_recv(0, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(0, 255, true), Ok(()));
+        pipe.server.stream_send(0, b"b", false).unwrap();
+
+        pipe.server.stream_recv(12, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(12, 42, true), Ok(()));
+        pipe.server.stream_send(12, b"b", false).unwrap();
+
+        pipe.server.stream_recv(8, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(8, 10, true), Ok(()));
+        pipe.server.stream_send(8, b"b", false).unwrap();
+
+        pipe.server.stream_recv(4, &mut b).unwrap();
+        assert_eq!(pipe.server.stream_priority(4, 42, true), Ok(()));
+        pipe.server.stream_send(4, b"b", false).unwrap();
+
+        // Stream 0 is re-prioritized!!!
+        assert_eq!(pipe.server.stream_priority(0, 20, true), Ok(()));
+
+        // First is stream 8.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 8,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        // Then is stream 0.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        // Then are stream 12 and 4, with the same priority.
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 12,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        let len = pipe.server.send(&mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            frames.iter().next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"b", 0, false),
+            })
+        );
+
+        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
     }
 }
 
