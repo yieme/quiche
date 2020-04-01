@@ -28,8 +28,6 @@ use std::cmp;
 
 use std::collections::hash_map;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use crate::Error;
@@ -43,14 +41,14 @@ const MAX_WRITE_SIZE: usize = 1000;
 #[derive(Default)]
 pub struct StreamMap {
     /// Map of streams indexed by stream ID.
-    streams: HashMap<u64, Stream>,
+    streams: rustc_hash::FxHashMap<u64, Stream>,
 
     /// Set of streams that were completed and garbage collected.
     ///
     /// Instead of keeping the full stream state forever, we collect completed
     /// streams to save memory, but we still need to keep track of previously
     /// created streams, to prevent peers from re-creating them.
-    collected: HashSet<u64>,
+    collected: rustc_hash::FxHashSet<u64>,
 
     /// Peer's maximum bidirectional stream count limit.
     peer_max_streams_bidi: u64,
@@ -88,24 +86,24 @@ pub struct StreamMap {
     /// Set of stream IDs corresponding to streams that have outstanding data
     /// to read. This is used to generate a `StreamIter` of streams without
     /// having to iterate over the full list of streams.
-    readable: HashSet<u64>,
+    readable: rustc_hash::FxHashSet<u64>,
 
     /// Set of stream IDs corresponding to streams that have enough flow control
     /// capacity to be written to, and is not finished. This is used to generate
     /// a `StreamIter` of streams without having to iterate over the full list
     /// of streams.
-    writable: HashSet<u64>,
+    writable: rustc_hash::FxHashSet<u64>,
 
     /// Set of stream IDs corresponding to streams that are almost out of flow
     /// control credit and need to send MAX_STREAM_DATA. This is used to
     /// generate a `StreamIter` of streams without having to iterate over the
     /// full list of streams.
-    almost_full: HashSet<u64>,
+    almost_full: rustc_hash::FxHashSet<u64>,
 
     /// Set of stream IDs corresponding to streams that are blocked. The value
     /// of the map elements represents the offset of the stream at which the
     /// blocking occurred.
-    blocked: HashMap<u64, u64>,
+    blocked: rustc_hash::FxHashMap<u64, u64>,
 }
 
 impl StreamMap {
@@ -511,7 +509,7 @@ pub struct StreamIter {
 }
 
 impl StreamIter {
-    fn from(streams: &HashSet<u64>) -> Self {
+    fn from<T>(streams: &std::collections::HashSet<u64, T>) -> Self {
         StreamIter {
             streams: streams.iter().copied().collect(),
         }
