@@ -27,19 +27,19 @@
 //! CUBIC Congestion Control
 //!
 //! This implementation is based on the following RFC:
-//!
 //! https://tools.ietf.org/html/rfc8312
-//!
 
 use std::cmp;
+
 use std::time::Duration;
 use std::time::Instant;
 
 use crate::recovery;
 use crate::recovery::reno;
+
+use crate::recovery::Acked;
 use crate::recovery::CongestionControlOps;
 use crate::recovery::Recovery;
-use crate::recovery::Sent;
 
 pub static CUBIC: CongestionControlOps = CongestionControlOps {
     on_packet_sent,
@@ -142,7 +142,7 @@ fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, now: Instant) {
     reno::on_packet_sent(r, sent_bytes, now);
 }
 
-fn on_packet_acked(r: &mut Recovery, packet: &Sent, now: Instant) {
+fn on_packet_acked(r: &mut Recovery, packet: &Acked, now: Instant) {
     let in_congestion_recovery = r.in_congestion_recovery(packet.time_sent);
     let cubic = &mut r.cubic_state;
 
@@ -256,10 +256,12 @@ mod tests {
         let mut r = Recovery::new(&cfg);
         let now = Instant::now();
 
-        let p = Sent {
+        let p = recovery::Sent {
             pkt_num: 0,
             frames: vec![],
             time_sent: now,
+            time_acked: None,
+            time_lost: None,
             size: 5000,
             ack_eliciting: true,
             in_flight: true,
@@ -278,7 +280,13 @@ mod tests {
 
         let cwnd_prev = r.cwnd();
 
-        r.on_packet_acked_cc(&p, now);
+        let acked = vec![Acked {
+            pkt_num: 0,
+            time_sent: now,
+            size: 5000,
+        }];
+
+        r.on_packets_acked(acked, now);
 
         // Check if cwnd increased by packet size (slow start)
         assert_eq!(r.cwnd(), cwnd_prev + p.size);
@@ -320,23 +328,16 @@ mod tests {
 
         let rtt = Duration::from_millis(100);
 
-        let p = Sent {
+        let acked = vec![Acked {
             pkt_num: 0,
-            frames: vec![],
             // To exit from recovery
             time_sent: now + rtt,
             size: 1000,
-            ack_eliciting: true,
-            in_flight: true,
-            delivered: 0,
-            delivered_time: now,
-            recent_delivered_packet_sent_time: now,
-            is_app_limited: false,
-        };
+        }];
 
         // Ack 1000 bytes with rtt=100ms
         r.update_rtt(rtt, Duration::from_millis(0), now);
-        r.on_packet_acked_cc(&p, now + rtt * 2);
+        r.on_packets_acked(acked, now + rtt * 2);
 
         // Expecting a small increase (congestion avoidance mode)
         assert_eq!(r.cwnd(), 10408);
@@ -360,30 +361,23 @@ mod tests {
         r.collapse_cwnd();
         assert_eq!(r.cwnd(), recovery::MINIMUM_WINDOW);
 
-        let p = Sent {
+        let acked = vec![Acked {
             pkt_num: 0,
-            frames: vec![],
             // To exit from recovery
             time_sent: now + Duration::from_millis(1),
             size: 10000,
-            ack_eliciting: true,
-            in_flight: true,
-            delivered: 0,
-            delivered_time: now,
-            recent_delivered_packet_sent_time: now,
-            is_app_limited: false,
-        };
+        }];
 
         // rtt = 100ms
         let rtt = Duration::from_millis(100);
         std::thread::sleep(rtt);
 
         // Ack 10000 x 2 to exit from slow start
-        r.on_packet_acked_cc(&p, now);
+        r.on_packets_acked(acked.clone(), now);
         std::thread::sleep(rtt);
 
         // This will make CC into congestion avoidance mode
-        r.on_packet_acked_cc(&p, now);
+        r.on_packets_acked(acked, now);
 
         assert_eq!(r.cwnd(), recovery::MINIMUM_WINDOW + 10000);
     }

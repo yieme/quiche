@@ -27,9 +27,10 @@
 use std::time::Instant;
 
 use crate::recovery;
+
+use crate::recovery::Acked;
 use crate::recovery::CongestionControlOps;
 use crate::recovery::Recovery;
-use crate::recovery::Sent;
 
 pub static RENO: CongestionControlOps = CongestionControlOps {
     on_packet_sent,
@@ -42,7 +43,7 @@ pub fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, _now: Instant) {
     r.bytes_in_flight += sent_bytes;
 }
 
-fn on_packet_acked(r: &mut Recovery, packet: &Sent, _now: Instant) {
+fn on_packet_acked(r: &mut Recovery, packet: &Acked, _now: Instant) {
     r.bytes_in_flight = r.bytes_in_flight.saturating_sub(packet.size);
 
     if r.in_congestion_recovery(packet.time_sent) {
@@ -122,10 +123,12 @@ mod tests {
 
         let now = Instant::now();
 
-        let p = Sent {
+        let p = recovery::Sent {
             pkt_num: 0,
             frames: vec![],
             time_sent: now,
+            time_acked: None,
+            time_lost: None,
             size: 5000,
             ack_eliciting: true,
             in_flight: true,
@@ -144,7 +147,13 @@ mod tests {
 
         let cwnd_prev = r.cwnd();
 
-        r.on_packet_acked_cc(&p, now);
+        let acked = vec![Acked {
+            pkt_num: 0,
+            time_sent: now,
+            size: 5000,
+        }];
+
+        r.on_packets_acked(acked, now);
 
         // Check if cwnd increased by packet size (slow start).
         assert_eq!(r.cwnd(), cwnd_prev + p.size);
@@ -186,23 +195,16 @@ mod tests {
         // In Reno, after congestion event, cwnd will be cut in half.
         assert_eq!(prev_cwnd / 2, r.cwnd());
 
-        let p = Sent {
+        let acked = vec![Acked {
             pkt_num: 0,
-            frames: vec![],
             time_sent: now,
             size: 5000,
-            ack_eliciting: true,
-            in_flight: true,
-            delivered: 0,
-            delivered_time: std::time::Instant::now(),
-            recent_delivered_packet_sent_time: std::time::Instant::now(),
-            is_app_limited: false,
-        };
+        }];
 
         let prev_cwnd = r.cwnd();
 
         // Ack 5000 bytes.
-        r.on_packet_acked_cc(&p, now);
+        r.on_packets_acked(acked, now);
 
         // Check if cwnd increase is smaller than a packet size (congestion
         // avoidance).
