@@ -117,10 +117,12 @@ pub struct Recovery {
     cc_ops: &'static CongestionControlOps,
 
     congestion_window: usize,
+    congestion_window_prev: usize,
 
     bytes_in_flight: usize,
 
     ssthresh: usize,
+    ssthresh_prev: usize,
 
     congestion_recovery_start_time: Option<Instant>,
 
@@ -174,10 +176,12 @@ impl Recovery {
             time_thresh: INITIAL_TIME_THRESHOLD,
 
             congestion_window: INITIAL_WINDOW,
+            congestion_window_prev: 0,
 
             bytes_in_flight: 0,
 
             ssthresh: std::usize::MAX,
+            ssthresh_prev: 0,
 
             congestion_recovery_start_time: None,
 
@@ -254,6 +258,8 @@ impl Recovery {
 
         let mut newly_acked = Vec::new();
 
+        let mut undo_cwnd = false;
+
         let max_rtt = cmp::max(self.latest_rtt, self.rtt());
 
         // Detect and mark acked packets, without removing them from the sent
@@ -286,8 +292,11 @@ impl Recovery {
                     // Calculate new time reordering threshold.
                     let loss_delay = max_rtt.mul_f64(self.time_thresh);
                     if now.duration_since(unacked.time_sent) > loss_delay {
+                        // TODO: do time threshold update
                         self.time_thresh = 5_f64 / 4_f64;
                     }
+
+                    undo_cwnd = true;
 
                     self.lost_spurious_count += 1;
                     continue;
@@ -316,6 +325,11 @@ impl Recovery {
 
                 trace!("{} packet newly acked {}", trace_id, unacked.pkt_num);
             }
+        }
+
+        // Undo congestion window update.
+        if undo_cwnd {
+            self.undo_cwnd();
         }
 
         self.delivery_rate.estimate();
@@ -670,11 +684,23 @@ impl Recovery {
     }
 
     fn congestion_event(&mut self, time_sent: Instant, now: Instant) {
+        self.congestion_window_prev = self.congestion_window;
+        self.ssthresh_prev = self.ssthresh;
+
         (self.cc_ops.congestion_event)(self, time_sent, now);
     }
 
     fn collapse_cwnd(&mut self) {
         (self.cc_ops.collapse_cwnd)(self);
+    }
+
+    fn undo_cwnd(&mut self) {
+        if self.ssthresh_prev != 0 {
+            (self.cc_ops.undo_cwnd)(self);
+        }
+
+        self.ssthresh_prev = 0;
+        self.congestion_window_prev = 0;
     }
 
     pub fn rate_check_app_limited(&mut self) {
@@ -739,6 +765,8 @@ pub struct CongestionControlOps {
     pub congestion_event: fn(r: &mut Recovery, time_sent: Instant, now: Instant),
 
     pub collapse_cwnd: fn(r: &mut Recovery),
+
+    pub undo_cwnd: fn(r: &mut Recovery),
 }
 
 impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {

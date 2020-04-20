@@ -46,6 +46,7 @@ pub static CUBIC: CongestionControlOps = CongestionControlOps {
     on_packet_acked,
     congestion_event,
     collapse_cwnd,
+    undo_cwnd,
 };
 
 /// CUBIC Constants.
@@ -115,6 +116,10 @@ fn collapse_cwnd(r: &mut Recovery) {
     r.ssthresh = cmp::max(r.ssthresh, recovery::MINIMUM_WINDOW);
 
     reno::collapse_cwnd(r);
+}
+
+pub fn undo_cwnd(r: &mut Recovery) {
+    reno::undo_cwnd(r);
 }
 
 fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, now: Instant) {
