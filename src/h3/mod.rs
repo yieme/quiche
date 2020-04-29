@@ -742,14 +742,10 @@ impl Connection {
             },
         };
 
-        // TODO: for testing purposes we calculate the quic priority every time
-        // that we write bytes into the the transport. This allows incremental
-        // streams to react to the changing set of streams in the connection.
-        // However, the call is pretty costly so perhaps there is a better way to
-        // approach this.
-        let quic_priority = http_priority.to_quiche(stream_id, &self.streams);
+        // TODO: for testing purposes we set the quic priority every time we
+        // send body bytes
 
-        match conn.stream_priority(stream_id, quic_priority) {
+        match conn.stream_priority(stream_id, http_priority.urgency, http_priority.incremental) {
             Ok(_) => (),
 
             Err(crate::Error::Done) => (),
