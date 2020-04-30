@@ -194,9 +194,6 @@ impl Recovery {
                 self.time_of_last_sent_ack_eliciting_pkt[epoch] = Some(now);
             }
 
-            self.app_limited =
-                (self.bytes_in_flight + sent_bytes) < self.congestion_window;
-
             self.on_packet_sent_cc(sent_bytes, now);
 
             self.set_loss_detection_timer(handshake_completed);
@@ -611,6 +608,10 @@ impl Recovery {
         }
     }
 
+    pub fn app_limited(&mut self, v: bool) {
+        self.app_limited = v;
+    }
+
     #[cfg(feature = "qlog")]
     pub fn to_qlog(&self) -> qlog::event::Event {
         // QVis can't use all these fields and they can be large.
@@ -706,6 +707,7 @@ impl std::fmt::Debug for Recovery {
         write!(f, "cwnd={} ", self.congestion_window)?;
         write!(f, "ssthresh={} ", self.ssthresh)?;
         write!(f, "bytes_in_flight={} ", self.bytes_in_flight)?;
+        write!(f, "app_limited={} ", self.app_limited)?;
         write!(f, "{:?}", self.delivery_rate)?;
 
         Ok(())

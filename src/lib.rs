@@ -1884,6 +1884,10 @@ impl Connection {
         // Limit output packet size to respect peer's max_packet_size limit.
         left = cmp::min(left, max_pkt_len);
 
+        // Update app_limited.
+        self.recovery
+            .app_limited(left <= self.recovery.cwnd_available());
+
         // Limit output packet size by congestion window size.
         left = cmp::min(left, self.recovery.cwnd_available());
 
